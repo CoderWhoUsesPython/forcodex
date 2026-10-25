@@ -122,6 +122,27 @@ static void test_statuses(void)
           "process basic information length validation");
     check(query_thread(GetCurrentThread(),0,buffer,48,&returned)==0,
           "thread basic information query");
+    {
+        const ULONG classes[]={0,1,9};
+        unsigned i;
+        for(i=0;i<sizeof(classes)/sizeof(classes[0]);i++)
+        {
+            NTSTATUS status;
+            char label[96];
+            returned=0xdeadbeef;
+            status=query_thread(GetCurrentThread(),classes[i],buffer,0,&returned);
+            snprintf(label,sizeof(label),"thread class %lu rejects zero length",classes[i]);
+            check((ULONG)status==0xc0000004,label);
+            snprintf(label,sizeof(label),"thread class %lu preserves failure ReturnLength",classes[i]);
+            check(returned==0xdeadbeef,label);
+        }
+        returned=0xdeadbeef;
+        check((ULONG)query_thread(GetCurrentThread(),4,buffer,8,&returned)==0xc0000003,
+              "thread affinity is not a query class");
+        returned=0xdeadbeef;
+        check((ULONG)query_process(GetCurrentProcess(),0,buffer,0,&returned)==0xc0000004 &&
+              returned==0xdeadbeef,"process length error preserves ReturnLength");
+    }
 }
 
 static void test_resources_and_exports(HMODULE ntdll)
@@ -170,20 +191,24 @@ static void record_sweeps(void)
 {
     FILE *f=fopen("accuracy-statuses.csv","w");
     BYTE buffer[512];
+    static const ULONG lengths[]={0,1,4,8,16,24,32,48,64,128,512};
     ULONG i,len,returned;
+    unsigned j;
     NTSTATUS status;
     if(!f) { check(0,"open sweep CSV"); return; }
     fprintf(f,"api,class,length,status,return_length\n");
     for(i=0;i<=0x73;i++)
-        for(len=0;len<=8;len+=4)
+        for(j=0;j<sizeof(lengths)/sizeof(lengths[0]);j++)
         {
+            len=lengths[j];
             returned=0xdeadbeef; memset(buffer,0xcc,sizeof(buffer));
             status=query_process(GetCurrentProcess(),i,buffer,len,&returned);
             fprintf(f,"process,%lu,%lu,%08lx,%lu\n",i,len,(ULONG)status,returned);
         }
     for(i=0;i<=0x3b;i++)
-        for(len=0;len<=8;len+=4)
+        for(j=0;j<sizeof(lengths)/sizeof(lengths[0]);j++)
         {
+            len=lengths[j];
             returned=0xdeadbeef; memset(buffer,0xcc,sizeof(buffer));
             status=query_thread(GetCurrentThread(),i,buffer,len,&returned);
             fprintf(f,"thread,%lu,%lu,%08lx,%lu\n",i,len,(ULONG)status,returned);
