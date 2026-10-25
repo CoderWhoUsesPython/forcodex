@@ -8,7 +8,7 @@ Get-CimInstance Win32_Processor |
   ConvertTo-Json | Set-Content out/cpu.json
 Push-Location out
 try {
-  foreach ($name in @('accuracy', 'context-O0', 'context-O2')) {
+  foreach ($name in @('accuracy', 'context-O0', 'context-O2', 'cpu-state')) {
     & ".\$name.exe" 2>&1 | Tee-Object "$name.log"
     $code = $LASTEXITCODE
     "$name=$code" | Add-Content exit-codes.txt
