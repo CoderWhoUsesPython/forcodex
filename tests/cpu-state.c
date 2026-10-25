@@ -60,10 +60,11 @@ int main(void)
     __asm__ volatile("rdpkru" : "=a"(lo),"=d"(hi) : "c"(0));
     printf("RDPKRU success=%d eax=%08x edx=%08x\n",illegal==before,lo,hi);
     check((illegal==before)==!!(c&16),"RDPKRU agrees with OS enablement");
-    if (illegal==before) {
-        __asm__ volatile("wrpkru" :: "a"(lo),"d"(0),"c"(0) : "memory");
-        check(illegal==before,"WRPKRU restores unchanged value");
-    }
+    if (illegal!=before) lo=0;
+    before=illegal;
+    __asm__ volatile("wrpkru" :: "a"(lo),"d"(0),"c"(0) : "memory");
+    printf("WRPKRU success=%d\n",illegal==before);
+    check((illegal==before)==!!(c&16),"WRPKRU agrees with OS enablement");
     test_trap_flag();
     check(steps==1,"trap flag delivers one exception");
     old.ContextFlags=CONTEXT_DEBUG_REGISTERS;
