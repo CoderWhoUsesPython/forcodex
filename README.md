@@ -41,3 +41,14 @@ Both directories must contain `accuracy-statuses.csv`; matching context logs
 are compared when available. Status and return-length differences require
 review for OS-version, environment, and unimplemented-feature differences.
 The tool reports differences without treating all of them as Wine defects.
+
+## CPU and debug-register observations
+
+`cpu-state.c` is a separate original probe for CPUID PKU/OSPKE exposure, both
+PKRU instructions, trap-flag delivery and an execution breakpoint set on the
+current thread. [Run 40161556948](https://github.com/CoderWhoUsesPython/forcodex/actions/runs/40161556948)
+passes all seven checks on Windows. The VM exposes PKU=0 and OSPKE=0, and both
+instructions raise STATUS_ILLEGAL_INSTRUCTION. The identical executable passes
+all seven checks on the local Intel Linux/Wine host, which instead exposes
+PKU=1 and OSPKE=1 and executes both instructions. The differing host CPUs mean
+this comparison does not establish Windows CPU exposure on that Intel laptop.
