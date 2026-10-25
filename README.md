@@ -52,3 +52,17 @@ instructions raise STATUS_ILLEGAL_INSTRUCTION. The identical executable passes
 all seven checks on the local Intel Linux/Wine host, which instead exposes
 PKU=1 and OSPKE=1 and executes both instructions. The differing host CPUs mean
 this comparison does not establish Windows CPU exposure on that Intel laptop.
+
+## Kernel-pool query work
+
+[Windows run 40206727685](https://github.com/CoderWhoUsesPython/forcodex/actions/runs/40206727685)
+adds buffer-contract references for pool tags and big pools. Experimental
+[Wine-side patches](patches/wine/README.md) now account Wine's own kernel pool
+allocations and implement both query classes. The patches are validated locally
+but do not establish a working Roblox launch.
+
+`tests/wine-pool-accounting.c` is a Wine-local integration test, excluded from
+the Windows workflow. It verifies actual allocation/free counters, committed
+large-block sizes, executable/NX types, concurrent access, cross-process query,
+process-exit cleanup, and module unload. It passes 37 checks with either a
+64-bit or 32-bit allocation child queried by the 64-bit parent.

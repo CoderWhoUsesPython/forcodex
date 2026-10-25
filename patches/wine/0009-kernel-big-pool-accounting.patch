@@ -1,0 +1,500 @@
+Subject: [PATCH] Report and account page-backed large kernel pool allocations.
+
+Implement SystemBigPoolInformation from real Wine kernel pool allocations.
+Page-align and separately back large blocks; preserve executable/NX pool types.
+Release all accounting on explicit ntoskrnl unload as well as process exit.
+
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -3035,6 +3035,20 @@
+     ULONG Count;
+     SYSTEM_POOLTAG TagInfo[1];
+ } SYSTEM_POOLTAG_INFORMATION, *PSYSTEM_POOLTAG_INFORMATION;
++
++/* System Information Class 0x42 */
++typedef struct _SYSTEM_BIGPOOL_ENTRY
++{
++    union { PVOID VirtualAddress; ULONG_PTR NonPaged : 1; };
++    SIZE_T SizeInBytes;
++    union { UCHAR Tag[4]; ULONG TagUlong; };
++} SYSTEM_BIGPOOL_ENTRY, *PSYSTEM_BIGPOOL_ENTRY;
++
++typedef struct _SYSTEM_BIGPOOL_INFORMATION
++{
++    ULONG Count;
++    SYSTEM_BIGPOOL_ENTRY AllocatedInfo[1];
++} SYSTEM_BIGPOOL_INFORMATION, *PSYSTEM_BIGPOOL_INFORMATION;
+ 
+ /* System Information Class 0x10 */
+ 
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -60,6 +60,14 @@
+     unsigned int nonpaged_allocs;
+     unsigned int nonpaged_frees;
+     mem_size_t   nonpaged_used;
++};
++
++struct kernel_big_pool
++{
++    client_ptr_t address;
++    mem_size_t size;
++    unsigned int tag;
++    int nonpaged;
+ };
+ 
+ struct request_header
+@@ -4392,6 +4400,7 @@
+     unsigned int tag;
+     int          paged;
+     int          allocate;
++    int          large;
+ @END
+ 
+ /* Enumerate actual tagged allocations from Wine's kernel compatibility layer. */
+@@ -4400,3 +4409,15 @@
+     unsigned int count;
+     VARARG(tags,bytes);
+ @END
++
++
++/* Enumerate page-backed large kernel pool allocations. */
++@REQ(get_kernel_big_pools)
++@REPLY
++    unsigned int count;
++    VARARG(pools,bytes);
++@END
++
++/* Release accounting when a process unloads its kernel compatibility module. */
++@REQ(clear_kernel_pools)
++@END
+--- a/server/process.c
++++ b/server/process.c
+@@ -2067,6 +2067,7 @@
+     mem_size_t size;
+     struct kernel_pool_stats *tag;
+     int paged;
++    int large;
+ };
+ 
+ static struct list kernel_pool_tags = LIST_INIT(kernel_pool_tags);
+@@ -2135,6 +2136,7 @@
+     allocation->size = req->size;
+     allocation->tag = tag;
+     allocation->paged = !!req->paged;
++    allocation->large = !!req->large;
+     list_add_tail( &kernel_pool_allocations, &allocation->entry );
+     if (allocation->paged)
+     {
+@@ -2168,3 +2170,35 @@
+     }
+     if (capacity < count) set_error( STATUS_INFO_LENGTH_MISMATCH );
+ }
++
++
++DECL_HANDLER(get_kernel_big_pools)
++{
++    struct kernel_pool_allocation *allocation;
++    struct kernel_big_pool *buffer;
++    unsigned int count = 0, capacity, copied = 0;
++
++    LIST_FOR_EACH_ENTRY( allocation, &kernel_pool_allocations, struct kernel_pool_allocation, entry )
++        if (allocation->large) count++;
++    reply->count = count;
++    capacity = min( count, get_reply_max_size() / sizeof(*buffer) );
++    if (capacity)
++    {
++        if (!(buffer = set_reply_data_size( capacity * sizeof(*buffer) ))) return;
++        LIST_FOR_EACH_ENTRY( allocation, &kernel_pool_allocations, struct kernel_pool_allocation, entry )
++        {
++            if (!allocation->large) continue;
++            buffer[copied].address = allocation->address;
++            buffer[copied].size = allocation->size;
++            buffer[copied].tag = allocation->tag->stats.tag;
++            buffer[copied].nonpaged = !allocation->paged;
++            if (++copied == capacity) break;
++        }
++    }
++    if (capacity < count) set_error( STATUS_INFO_LENGTH_MISMATCH );
++}
++
++DECL_HANDLER(clear_kernel_pools)
++{
++    cleanup_kernel_pools( current->process );
++}
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -68,6 +68,13 @@
+ 
+ static HANDLE ntoskrnl_heap;
+ DECLARE_CRITICAL_SECTION(pool_cs);
++struct large_pool_allocation
++{
++    struct list entry;
++    void *address;
++};
++static struct list large_pool_allocations = LIST_INIT(large_pool_allocations);
++
+ 
+ static void *ldr_notify_cookie;
+ 
+@@ -2252,47 +2259,74 @@
+  */
+ void * WINAPI ExAllocatePool2( POOL_FLAGS flags, SIZE_T size, ULONG tag )
+ {
+-    /* FIXME: handle page alignment constraints */
+-    void *ret;
+-
++    struct large_pool_allocation *allocation = NULL;
++    SIZE_T bytes = size;
++    void *ret = NULL;
++    NTSTATUS status;
++
++    if (size > ~(SIZE_T)0 - (PAGE_SIZE - 1)) return NULL;
+     EnterCriticalSection( &pool_cs );
+-    ret = HeapAlloc( ntoskrnl_heap, 0, size );
++    if (size >= PAGE_SIZE)
++    {
++        bytes = (size + PAGE_SIZE - 1) & ~(SIZE_T)(PAGE_SIZE - 1);
++        if (!(allocation = HeapAlloc( ntoskrnl_heap, 0, sizeof(*allocation) ))) goto done;
++        ret = VirtualAlloc( NULL, bytes, MEM_RESERVE | MEM_COMMIT,
++                            flags & POOL_FLAG_NON_PAGED_EXECUTE ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE );
++        if (!ret)
++        {
++            HeapFree( ntoskrnl_heap, 0, allocation );
++            goto done;
++        }
++    }
++    else ret = HeapAlloc( ntoskrnl_heap, 0, size );
+     TRACE( "(0x%I64x, %Iu, %s) -> %p\n", flags, size, debugstr_fourcc(tag), ret );
+     if (ret)
+     {
+-        NTSTATUS status;
+         SERVER_START_REQ( update_kernel_pool )
+         {
+             req->address = wine_server_client_ptr( ret );
+-            req->size = size;
++            req->size = bytes;
+             req->tag = tag;
+             req->paged = !!(flags & POOL_FLAG_PAGED);
+             req->allocate = 1;
++            req->large = !!allocation;
+             status = wine_server_call( req );
+         }
+         SERVER_END_REQ;
+         if (status)
+         {
+-            HeapFree( ntoskrnl_heap, 0, ret );
++            if (allocation)
++            {
++                VirtualFree( ret, 0, MEM_RELEASE );
++                HeapFree( ntoskrnl_heap, 0, allocation );
++            }
++            else HeapFree( ntoskrnl_heap, 0, ret );
+             ret = NULL;
+         }
+-    }
++        else if (allocation)
++        {
++            allocation->address = ret;
++            list_add_tail( &large_pool_allocations, &allocation->entry );
++        }
++    }
++done:
+     LeaveCriticalSection( &pool_cs );
+     return ret;
+ }
+ 
+ static POOL_FLAGS pool_type_to_flags( POOL_TYPE type )
+ {
++    const BOOL nx = type & 0x200; /* NonPagedPoolNx */
+     switch (type & 7)
+     {
+     case NonPagedPool:
+     case NonPagedPoolMustSucceed:
+-        return POOL_FLAG_NON_PAGED;
++        return nx ? POOL_FLAG_NON_PAGED : POOL_FLAG_NON_PAGED_EXECUTE;
+     case PagedPool:
+         return POOL_FLAG_PAGED;
+     case NonPagedPoolCacheAligned:
+     case NonPagedPoolCacheAlignedMustS:
+-        return POOL_FLAG_NON_PAGED|POOL_FLAG_CACHE_ALIGNED;
++        return (nx ? POOL_FLAG_NON_PAGED : POOL_FLAG_NON_PAGED_EXECUTE) | POOL_FLAG_CACHE_ALIGNED;
+     case PagedPoolCacheAligned:
+         return POOL_FLAG_PAGED|POOL_FLAG_CACHE_ALIGNED;
+     default:
+@@ -2396,10 +2430,25 @@
+ void WINAPI ExFreePoolWithTag( void *ptr, ULONG tag )
+ {
+     client_ptr_t address = wine_server_client_ptr( ptr );
++    struct large_pool_allocation *allocation;
++    BOOL freed = FALSE;
+ 
+     TRACE( "%p\n", ptr );
++    if (!ptr) return;
+     EnterCriticalSection( &pool_cs );
+-    if (ptr && HeapFree( ntoskrnl_heap, 0, ptr ))
++    LIST_FOR_EACH_ENTRY( allocation, &large_pool_allocations, struct large_pool_allocation, entry )
++    {
++        if (allocation->address != ptr) continue;
++        if ((freed = VirtualFree( ptr, 0, MEM_RELEASE )))
++        {
++            list_remove( &allocation->entry );
++            HeapFree( ntoskrnl_heap, 0, allocation );
++        }
++        goto updated;
++    }
++    freed = HeapFree( ntoskrnl_heap, 0, ptr );
++updated:
++    if (freed)
+     {
+         SERVER_START_REQ( update_kernel_pool )
+         {
+@@ -5155,7 +5204,18 @@
+         if (dpc_call_tp)
+             CloseThreadpool(dpc_call_tp);
+ 
++        {
++            struct large_pool_allocation *allocation;
++            LIST_FOR_EACH_ENTRY( allocation, &large_pool_allocations, struct large_pool_allocation, entry )
++                VirtualFree( allocation->address, 0, MEM_RELEASE );
++            list_init( &large_pool_allocations );
++        }
+         HeapDestroy( ntoskrnl_heap );
++        SERVER_START_REQ( clear_kernel_pools )
++        {
++            wine_server_call( req );
++        }
++        SERVER_END_REQ;
+         RtlRemoveVectoredExceptionHandler( handler );
+         break;
+     }
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -3360,6 +3360,44 @@
+     switch (class)
+     {
+ 
++    case SystemBigPoolInformation:
++    {
++        SYSTEM_BIGPOOL_INFORMATION *pool = info;
++        struct kernel_big_pool *entries;
++        unsigned int count = 0, copied = 0, i, capacity;
++
++        if (size && !virtual_check_buffer_for_write( info, size )) return STATUS_ACCESS_VIOLATION;
++        len = sizeof(*pool);
++        if (size < len)
++        {
++            ret = STATUS_INFO_LENGTH_MISMATCH;
++            break;
++        }
++        capacity = (size - offsetof(SYSTEM_BIGPOOL_INFORMATION, AllocatedInfo)) / sizeof(SYSTEM_BIGPOOL_ENTRY);
++        if (!(entries = malloc( capacity * sizeof(*entries) ))) return STATUS_NO_MEMORY;
++        SERVER_START_REQ( get_kernel_big_pools )
++        {
++            wine_server_set_reply( req, entries, capacity * sizeof(*entries) );
++            ret = wine_server_call( req );
++            count = reply->count;
++            copied = wine_server_reply_size( reply ) / sizeof(*entries);
++        }
++        SERVER_END_REQ;
++        if (!ret || ret == STATUS_INFO_LENGTH_MISMATCH)
++        {
++            len = max( sizeof(*pool), offsetof(SYSTEM_BIGPOOL_INFORMATION, AllocatedInfo) + count * sizeof(SYSTEM_BIGPOOL_ENTRY) );
++            memset( pool, 0, min(size, len) );
++            pool->Count = count;
++            for (i = 0; i < copied; ++i)
++            {
++                pool->AllocatedInfo[i].VirtualAddress = (void *)((ULONG_PTR)entries[i].address | !!entries[i].nonpaged);
++                pool->AllocatedInfo[i].SizeInBytes = entries[i].size;
++                pool->AllocatedInfo[i].TagUlong = entries[i].tag;
++            }
++        }
++        free( entries );
++        break;
++    }
+     case SystemPoolTagInformation:
+     {
+         SYSTEM_POOLTAG_INFORMATION *pool = info;
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -44,6 +44,14 @@
+     unsigned int nonpaged_allocs;
+     unsigned int nonpaged_frees;
+     mem_size_t   nonpaged_used;
++};
++
++struct kernel_big_pool
++{
++    client_ptr_t address;
++    mem_size_t size;
++    unsigned int tag;
++    int nonpaged;
+ };
+ 
+ struct request_header
+@@ -6321,7 +6329,7 @@
+     unsigned int tag;
+     int          paged;
+     int          allocate;
+-    char __pad_44[4];
++    int          large;
+ };
+ struct update_kernel_pool_reply
+ {
+@@ -6340,6 +6348,32 @@
+     unsigned int count;
+     /* VARARG(tags,bytes); */
+     char __pad_12[4];
++};
++
++
++
++struct get_kernel_big_pools_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct get_kernel_big_pools_reply
++{
++    struct reply_header __header;
++    unsigned int count;
++    /* VARARG(pools,bytes); */
++    char __pad_12[4];
++};
++
++
++struct clear_kernel_pools_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct clear_kernel_pools_reply
++{
++    struct reply_header __header;
+ };
+ 
+ 
+@@ -6659,6 +6693,8 @@
+     REQ_dcomp_get_shared_visual_info,
+     REQ_update_kernel_pool,
+     REQ_get_kernel_pool_tags,
++    REQ_get_kernel_big_pools,
++    REQ_clear_kernel_pools,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6980,6 +7016,8 @@
+     struct dcomp_get_shared_visual_info_request dcomp_get_shared_visual_info_request;
+     struct update_kernel_pool_request update_kernel_pool_request;
+     struct get_kernel_pool_tags_request get_kernel_pool_tags_request;
++    struct get_kernel_big_pools_request get_kernel_big_pools_request;
++    struct clear_kernel_pools_request clear_kernel_pools_request;
+ };
+ union generic_reply
+ {
+@@ -7299,8 +7337,10 @@
+     struct dcomp_get_shared_visual_info_reply dcomp_get_shared_visual_info_reply;
+     struct update_kernel_pool_reply update_kernel_pool_reply;
+     struct get_kernel_pool_tags_reply get_kernel_pool_tags_reply;
+-};
+-
+-#define SERVER_PROTOCOL_VERSION 966
++    struct get_kernel_big_pools_reply get_kernel_big_pools_reply;
++    struct clear_kernel_pools_reply clear_kernel_pools_reply;
++};
++
++#define SERVER_PROTOCOL_VERSION 967
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -321,6 +321,8 @@
+ DECL_HANDLER(dcomp_get_shared_visual_info);
+ DECL_HANDLER(update_kernel_pool);
+ DECL_HANDLER(get_kernel_pool_tags);
++DECL_HANDLER(get_kernel_big_pools);
++DECL_HANDLER(clear_kernel_pools);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -639,6 +641,8 @@
+     (req_handler)req_dcomp_get_shared_visual_info,
+     (req_handler)req_update_kernel_pool,
+     (req_handler)req_get_kernel_pool_tags,
++    (req_handler)req_get_kernel_big_pools,
++    (req_handler)req_clear_kernel_pools,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2424,7 +2428,12 @@
+ C_ASSERT( offsetof(struct update_kernel_pool_request, tag) == 32 );
+ C_ASSERT( offsetof(struct update_kernel_pool_request, paged) == 36 );
+ C_ASSERT( offsetof(struct update_kernel_pool_request, allocate) == 40 );
++C_ASSERT( offsetof(struct update_kernel_pool_request, large) == 44 );
+ C_ASSERT( sizeof(struct update_kernel_pool_request) == 48 );
+ C_ASSERT( sizeof(struct get_kernel_pool_tags_request) == 16 );
+ C_ASSERT( offsetof(struct get_kernel_pool_tags_reply, count) == 8 );
+ C_ASSERT( sizeof(struct get_kernel_pool_tags_reply) == 16 );
++C_ASSERT( sizeof(struct get_kernel_big_pools_request) == 16 );
++C_ASSERT( offsetof(struct get_kernel_big_pools_reply, count) == 8 );
++C_ASSERT( sizeof(struct get_kernel_big_pools_reply) == 16 );
++C_ASSERT( sizeof(struct clear_kernel_pools_request) == 16 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3576,6 +3576,7 @@
+     fprintf( stderr, ", tag=%08x", req->tag );
+     fprintf( stderr, ", paged=%d", req->paged );
+     fprintf( stderr, ", allocate=%d", req->allocate );
++    fprintf( stderr, ", large=%d", req->large );
+ }
+ 
+ static void dump_get_kernel_pool_tags_request( const struct get_kernel_pool_tags_request *req )
+@@ -3586,6 +3587,20 @@
+ {
+     fprintf( stderr, " count=%08x", req->count );
+     dump_varargs_bytes( ", tags=", cur_size );
++}
++
++static void dump_get_kernel_big_pools_request( const struct get_kernel_big_pools_request *req )
++{
++}
++
++static void dump_get_kernel_big_pools_reply( const struct get_kernel_big_pools_reply *req )
++{
++    fprintf( stderr, " count=%08x", req->count );
++    dump_varargs_bytes( ", pools=", cur_size );
++}
++
++static void dump_clear_kernel_pools_request( const struct clear_kernel_pools_request *req )
++{
+ }
+ 
+ typedef void (*dump_func)( const void *req );
+@@ -3906,6 +3921,8 @@
+     (dump_func)dump_dcomp_get_shared_visual_info_request,
+     (dump_func)dump_update_kernel_pool_request,
+     (dump_func)dump_get_kernel_pool_tags_request,
++    (dump_func)dump_get_kernel_big_pools_request,
++    (dump_func)dump_clear_kernel_pools_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4224,6 +4241,8 @@
+     (dump_func)dump_dcomp_get_shared_visual_info_reply,
+     NULL,
+     (dump_func)dump_get_kernel_pool_tags_reply,
++    (dump_func)dump_get_kernel_big_pools_reply,
++    NULL,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4542,6 +4561,8 @@
+     "dcomp_get_shared_visual_info",
+     "update_kernel_pool",
+     "get_kernel_pool_tags",
++    "get_kernel_big_pools",
++    "clear_kernel_pools",
+ };
+ 
+ static const struct
