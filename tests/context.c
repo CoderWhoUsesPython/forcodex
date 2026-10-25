@@ -7,6 +7,8 @@
 typedef NTSTATUS (WINAPI *continue_fn)(CONTEXT *, BOOLEAN);
 static unsigned checks, failures;
 static volatile LONG phase;
+extern void trigger_breakpoint(void);
+extern void trigger_access_violation(void);
 
 static __attribute__((noinline)) uintptr_t stack_pointer(void)
 {
@@ -36,7 +38,7 @@ static __attribute__((noinline)) void test_breakpoint(void)
     uintptr_t before=stack_pointer(), after;
     int caught=0;
     __try {
-        __debugbreak();
+        trigger_breakpoint();
     } __except(filter(GetExceptionInformation(),"int3")) {
         caught=1;
         printf("HANDLER int3 rsp_mod16=%llu\n",(unsigned long long)(stack_pointer()&15));
@@ -52,7 +54,7 @@ static __attribute__((noinline)) void test_nested(void)
     volatile LONG finally_count=0, caught=0;
     __try {
         __try {
-            *(volatile LONG *)(uintptr_t)0=1;
+            trigger_access_violation();
         } __finally {
             ++finally_count;
             printf("FINALLY rsp_mod16=%llu abnormal=%d\n",
