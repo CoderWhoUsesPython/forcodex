@@ -4,6 +4,7 @@
 #include <cpuid.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 typedef NTSTATUS (WINAPI *context_fn)(HANDLE, CONTEXT *);
 static volatile LONG illegal, steps, hits;
@@ -45,7 +46,7 @@ static __attribute__((noinline)) void target(void)
 extern void test_trap_flag(void);
 __asm__(".text\n.globl test_trap_flag\n"
         "test_trap_flag:\n pushfq\n orq $0x100,(%rsp)\n popfq\n nop\n ret\n");
-int main(void)
+int main(int argc, char **argv)
 {
     unsigned a=0,b=0,c=0,d=0,lo=0,hi=0;
     LONG before;
@@ -54,6 +55,7 @@ int main(void)
     context_fn get=(context_fn)(void *)GetProcAddress(ntdll,"NtGetContextThread");
     context_fn set=(context_fn)(void *)GetProcAddress(ntdll,"NtSetContextThread");
     void *veh=AddVectoredExceptionHandler(1,handler);
+    setvbuf(stdout,NULL,_IONBF,0);
     __cpuid_count(7,0,a,b,c,d);
     printf("CPUID7 eax=%08x ebx=%08x ecx=%08x edx=%08x PKU=%u OSPKE=%u\n",a,b,c,d,(c>>3)&1,(c>>4)&1);
     before=illegal;
@@ -65,6 +67,12 @@ int main(void)
     __asm__ volatile("wrpkru" :: "a"(lo),"d"(0),"c"(0) : "memory");
     printf("WRPKRU success=%d\n",illegal==before);
     check((illegal==before)==!!(c&16),"WRPKRU agrees with OS enablement");
+    if (argc==2 && !strcmp(argv[1],"--pku-only")) {
+        RemoveVectoredExceptionHandler(veh);
+        printf("RESULT: %u checks, %u failures (PKU only)\n",checks,failures);
+        fflush(stdout);
+        return failures ? 1 : 0;
+    }
     test_trap_flag();
     check(steps==1,"trap flag delivers one exception");
     old.ContextFlags=CONTEXT_DEBUG_REGISTERS;
