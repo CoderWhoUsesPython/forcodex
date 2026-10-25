@@ -29,6 +29,7 @@ jobs:
           mkdir -p out
           gcc --version > out/compiler.txt
           gcc -O2 -g -Wall -Wextra tests/cpu-state.c -o out/cpu-state.exe
+          gcc -O2 -g -Wall -Wextra tests/pool-tags.c -o out/pool-tags.exe
           clang --version >> out/compiler.txt
           gcc -O2 -g -Wall -Wextra -Wno-cast-function-type tests/accuracy.c -o out/accuracy.exe
           clang -O0 -g -fms-extensions -Wall -Wextra tests/context.c tests/triggers.S -o out/context-O0.exe
