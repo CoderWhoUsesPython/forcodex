@@ -1,0 +1,44 @@
+name: Windows API reference
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tests/**'
+      - 'scripts/**'
+      - '.github/workflows/windows-reference.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  reference:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-clang
+      - name: Build standalone probes
+        shell: msys2 {0}
+        run: |
+          mkdir -p out
+          gcc --version > out/compiler.txt
+          clang --version >> out/compiler.txt
+          gcc -O2 -g -Wall -Wextra -Wno-cast-function-type tests/accuracy.c -o out/accuracy.exe
+          clang -O0 -g -fms-extensions -Wall -Wextra tests/context.c -o out/context-O0.exe
+          clang -O2 -g -fms-extensions -Wall -Wextra tests/context.c -o out/context-O2.exe
+      - name: Record Windows and run probes
+        shell: pwsh
+        run: ./scripts/run-reference.ps1
+      - name: Upload reference artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-reference
+          path: out/
+          retention-days: 14
