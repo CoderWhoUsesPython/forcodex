@@ -13,6 +13,8 @@ try {
     $code = $LASTEXITCODE
     "$name=$code" | Add-Content exit-codes.txt
   }
+  & ".\pool-tags.exe" --big 2>&1 | Tee-Object "big-pool.log"
+  "big-pool=$LASTEXITCODE" | Add-Content exit-codes.txt
 } finally {
   Pop-Location
 }
