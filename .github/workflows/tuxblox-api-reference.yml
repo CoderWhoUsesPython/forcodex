@@ -1,0 +1,36 @@
+name: TuxBlox API reference
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile original standalone probes
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          mkdir out
+          cl /nologo /std:c11 /O2 /W3 tests\image-extension.c /Fe:out\image-extension.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c11 /O2 /W3 /D_CRT_SECURE_NO_WARNINGS tests\thread-lastcall.c /Fe:out\thread-lastcall.exe
+          if errorlevel 1 exit /b 1
+      - name: Run probes and record host
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select Caption,Version,BuildNumber | ConvertTo-Json | Set-Content out/windows.json
+          Get-CimInstance Win32_Processor | Select Name,Manufacturer | ConvertTo-Json | Set-Content out/cpu.json
+          & ./out/image-extension.exe 2>&1 | Tee-Object out/image-extension.log
+          "image-extension=$LASTEXITCODE" | Set-Content out/exit-codes.txt
+          & ./out/thread-lastcall.exe --parent 2>&1 | Tee-Object out/thread-lastcall.log
+          "thread-lastcall=$LASTEXITCODE" | Add-Content out/exit-codes.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tuxblox-api-reference
+          path: out/
+          retention-days: 14
