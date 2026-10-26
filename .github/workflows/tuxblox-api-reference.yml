@@ -21,6 +21,8 @@ jobs:
           if errorlevel 1 exit /b 1
           cl /nologo /std:c11 /O2 /W3 tests\privileged-instructions.c /Fe:out\privileged-instructions.exe
           if errorlevel 1 exit /b 1
+          cl /nologo /std:c11 /O2 /W3 tests\exception-xstate.c /Fe:out\exception-xstate.exe
+          if errorlevel 1 exit /b 1
       - name: Run probes and record host
         shell: pwsh
         run: |
@@ -32,6 +34,8 @@ jobs:
           "thread-lastcall=$LASTEXITCODE" | Add-Content out/exit-codes.txt
           & ./out/privileged-instructions.exe 2>&1 | Tee-Object out/privileged-instructions.log
           "privileged-instructions=$LASTEXITCODE" | Add-Content out/exit-codes.txt
+          & ./out/exception-xstate.exe 2>&1 | Tee-Object out/exception-xstate.log
+          "exception-xstate=$LASTEXITCODE" | Add-Content out/exit-codes.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
