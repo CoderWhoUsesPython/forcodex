@@ -25,6 +25,8 @@ jobs:
           if errorlevel 1 exit /b 1
           cl /nologo /std:c11 /O2 /W3 tests\exception-callback.c /Fe:out\exception-callback.exe
           if errorlevel 1 exit /b 1
+          cl /nologo /std:c11 /O2 /W3 tests\unwind-outputs.c /Fe:out\unwind-outputs.exe
+          if errorlevel 1 exit /b 1
       - name: Run probes and record host
         shell: pwsh
         run: |
@@ -40,6 +42,8 @@ jobs:
           "exception-xstate=$LASTEXITCODE" | Add-Content out/exit-codes.txt
           & ./out/exception-callback.exe 2>&1 | Tee-Object out/exception-callback.log
           "exception-callback=$LASTEXITCODE" | Add-Content out/exit-codes.txt
+          & ./out/unwind-outputs.exe 2>&1 | Tee-Object out/unwind-outputs.log
+          "unwind-outputs=$LASTEXITCODE" | Add-Content out/exit-codes.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
