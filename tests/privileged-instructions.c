@@ -1,6 +1,11 @@
 /* Original user-mode instruction exception probe. No application code. */
 #include <windows.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#define __cpuid_count(leaf,sub,a,b,c,d) do { int regs[4]; __cpuidex(regs,leaf,sub); a=regs[0]; b=regs[1]; c=regs[2]; d=regs[3]; } while(0)
+#else
 #include <cpuid.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
